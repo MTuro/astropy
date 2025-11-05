@@ -7,8 +7,8 @@ file.
 # STDLIB
 import hashlib
 import http.client
+import json
 import os
-import pickle
 import shutil
 import subprocess
 import urllib.error
@@ -46,6 +46,11 @@ class Result:
         return self._path
 
     def get_attribute_path(self):
+        # New, safe JSON-based storage
+        return os.path.join(self.get_dirpath(), "values.json")
+
+    def _get_legacy_attribute_path(self):
+        # Kept for backward-compatibility migration from pickle
         return os.path.join(self.get_dirpath(), "values.dat")
 
     def get_vo_xml_path(self):
@@ -55,21 +60,87 @@ class Result:
 
     def load_attributes(self):
         path = self.get_attribute_path()
+        legacy_path = self._get_legacy_attribute_path()
+
+        # Try JSON first
         if os.path.exists(path):
             try:
-                with open(path, "rb") as fd:
-                    self._attributes = pickle.load(fd)
+                with open(path, encoding="utf-8") as fd:
+                    data = json.load(fd)
+                # Normalize types
+                if isinstance(data, dict):
+                    # warning_types stored as list
+                    wt = data.get("warning_types")
+                    if isinstance(wt, set):
+                        data["warning_types"] = sorted(wt)
+                    elif isinstance(wt, list):
+                        # keep as-is
+                        pass
+                self._attributes = data if isinstance(data, dict) else {}
+                return
             except Exception:
+                # Corrupt JSON -> reset directory to a clean state
                 shutil.rmtree(self.get_dirpath())
                 os.makedirs(self.get_dirpath())
                 self._attributes = {}
-        else:
-            self._attributes = {}
+                return
+
+        # If JSON not present, try legacy pickle for migration
+        if os.path.exists(legacy_path):
+            try:
+                import pickle  # local import to avoid top-level import
+
+                with open(legacy_path, "rb") as fd:
+                    data = pickle.load(fd)
+
+                if not isinstance(data, dict):
+                    raise ValueError("Legacy attributes not a dict")
+
+                # Make JSON-safe: sets->lists, bytes->str
+                def _convert(value):
+                    if isinstance(value, set):
+                        return sorted(value)
+                    if isinstance(value, bytes):
+                        return value.decode("utf-8", "replace")
+                    if isinstance(value, dict):
+                        return {k: _convert(v) for k, v in value.items()}
+                    if isinstance(value, (list, tuple)):
+                        return [_convert(v) for v in value]
+                    return value
+
+                data = _convert(data)
+                self._attributes = data
+                # Write migrated JSON and keep going
+                self.save_attributes()
+                return
+            except Exception:
+                # On any error, fall back to a clean state
+                shutil.rmtree(self.get_dirpath())
+                os.makedirs(self.get_dirpath())
+                self._attributes = {}
+                return
+
+        # Nothing to load
+        self._attributes = {}
 
     def save_attributes(self):
         path = self.get_attribute_path()
-        with open(path, "wb") as fd:
-            pickle.dump(self._attributes, fd)
+
+        # Ensure JSON-serializable content
+        def _convert(value):
+            if isinstance(value, set):
+                return sorted(value)
+            if isinstance(value, bytes):
+                return value.decode("utf-8", "replace")
+            if isinstance(value, dict):
+                return {k: _convert(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_convert(v) for v in value]
+            return value
+
+        data = _convert(self._attributes)
+        with open(path, "w", encoding="utf-8") as fd:
+            json.dump(data, fd, ensure_ascii=False, indent=2)
 
     def __getitem__(self, key):
         return self._attributes[key]
@@ -193,7 +264,8 @@ class Result:
         self["nwarnings"] = nwarnings
         self["nexceptions"] = nexceptions
         self["warnings"] = lines
-        self["warning_types"] = warning_types
+        # Store as a list for safe JSON serialization
+        self["warning_types"] = sorted(warning_types)
 
     def has_warning(self, warning_code):
         return warning_code in self["warning_types"]
@@ -227,7 +299,11 @@ class Result:
             self["votlint"] = False
         else:
             self["votlint"] = True
-        self["votlint_content"] = stdout
+        # Store textual content for JSON safety
+        try:
+            self["votlint_content"] = stdout.decode("utf-8")
+        except Exception:
+            self["votlint_content"] = stdout.decode("ascii", "replace")
 
 
 def get_result_subsets(results, root, s=None):
